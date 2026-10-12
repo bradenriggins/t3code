@@ -121,6 +121,10 @@ function usageWindowEquals(a: ServerProviderUsageWindow, b: ServerProviderUsageW
  * per-window epoch bookkeeping needed to reconcile the two was more code
  * than the sub-second regression it prevented. The next runtime event
  * corrects it.
+ *
+ * An empty window list is not that full read. Muse's status host has not
+ * observed usage until a prompt in that process, so every refresh would
+ * otherwise erase the bars a turn already reported.
  */
 export function resolveUsageLimitsAfterProbe(input: {
   readonly published: ServerProviderUsageLimits | undefined;
@@ -128,6 +132,16 @@ export function resolveUsageLimitsAfterProbe(input: {
 }): ServerProviderUsageLimits | undefined {
   const { published, probed } = input;
   if (probed?.unavailable?.reason === "probeFailed" && published && !published.unavailable) {
+    return published;
+  }
+  if (
+    probed &&
+    probed.unavailable === undefined &&
+    probed.windows.length === 0 &&
+    published &&
+    published.unavailable === undefined &&
+    published.windows.length > 0
+  ) {
     return published;
   }
   return probed;

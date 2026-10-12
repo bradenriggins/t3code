@@ -50,6 +50,7 @@ import {
   MuseDelta,
   MuseItemEvent,
   MuseSessionResult,
+  MuseSubscriptionUsage,
   MuseTokenUsageEvent,
   MuseTodoList,
   MuseTurnRetryScheduled,
@@ -68,6 +69,7 @@ import {
   type createMuseSdkHost,
   type MuseSdkHost,
 } from "./sdk.ts";
+import type { ManagedServerProvider } from "@t3tools/provider-core/server/snapshot";
 import type * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import {
   providerMessageTextWithAttachmentPaths,
@@ -88,6 +90,12 @@ import {
 } from "@t3tools/provider-core/server/subagentProjection";
 import { turnScopedSelectionTransition } from "@t3tools/provider-core/server/selectionTransition";
 import { museItemStatus, museToolPresentation } from "./itemPresentation.ts";
+import {
+  isoFromEpochMs,
+  museTierLimitFailure,
+  museUsageToUpdate,
+  readMuseSubscriptionUsage,
+} from "./usageLimits.ts";
 
 const MUSE_PROVIDER = ProviderDriverKind.make("muse");
 const isOpenSessionError = Schema.is(ProviderAdapter.ProviderAdapterOpenSessionError);
@@ -195,6 +203,8 @@ export interface MuseAdapterV2Options {
   readonly createHost?: typeof createMuseSdkHost;
   readonly requestTimeoutMs?: number;
   readonly nativeEventLogger?: ProviderEventLoggers.EventNdjsonLogger;
+  /** Fold a subscription-usage update into the published provider snapshot. */
+  readonly onUsageLimits?: ManagedServerProvider["applyUsageLimits"];
   /** Where a turn Muse starts on its own (a finished workflow's report) asks for its run. */
   readonly continuationRequests?: {
     readonly offer: (
@@ -261,6 +271,8 @@ const INFORMATIONAL_NOTIFICATIONS = new Set([
   "session/tokenUsage",
   "session/todoListChanged",
   "turn/retryScheduled",
+  // Host-level, and a bad payload must not end the turn.
+  "usage/changed",
 ]);
 // Tools whose results already show as their own rows: T3's todo list and question
 // rows, and the workflow item a `workflow` call launches.
@@ -961,11 +973,32 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         yield* emit({ type: "node.updated", driver: MUSE_PROVIDER, node: entry.node });
         yield* emit({ type: "turn_item.updated", driver: MUSE_PROVIDER, turnItem: entry.item });
       });
+      // 1.4.4 answers usage/read with methodNotFound. Remember that so later turns skip it.
+      let usageReadSupported = true;
+      const publishSubscriptionUsage = Effect.fnUntraced(function* (usage: MuseSubscriptionUsage) {
+        if (!options.onUsageLimits) return;
+        yield* options.onUsageLimits({
+          ...museUsageToUpdate(usage),
+          checkedAt: isoFromEpochMs(usage.observedAtMs) ?? DateTime.formatIso(yield* DateTime.now),
+        });
+      });
+      const refreshSubscriptionUsage = Effect.fnUntraced(function* () {
+        if (!usageReadSupported || !options.onUsageLimits || closed) return;
+        const probe = yield* readMuseSubscriptionUsage((method, params) =>
+          host.connection.request(method, params),
+        );
+        if (probe.status === "unsupported") {
+          usageReadSupported = false;
+          return;
+        }
+        if (probe.status === "observed") yield* publishSubscriptionUsage(probe.usage);
+      });
       const finish = Effect.fnUntraced(function* (
         turn: ActiveTurn,
         status: "completed" | "cancelled" | "interrupted" | "failed",
         detail?: string,
         disposition: "reusable" | "broken" = "reusable",
+        quota?: { readonly resetAt?: string },
       ) {
         if (active !== turn || seenTerminals.has(turn.nativeId)) return;
         seenTerminals.add(turn.nativeId);
@@ -1005,8 +1038,13 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         active = undefined;
         if (status === "failed") {
           const failure = makeProviderFailure({
-            class: disposition === "broken" ? "transport_error" : "provider_error",
+            class: quota
+              ? "usage_limit"
+              : disposition === "broken"
+                ? "transport_error"
+                : "provider_error",
             message: detail ?? "Muse turn failed.",
+            ...(quota?.resetAt ? { resetAt: quota.resetAt } : {}),
           });
           const base = baseItem(turn, `failure:${turn.nativeId}`, completedAt);
           yield* emit({
@@ -1016,7 +1054,7 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
               ...base,
               type: "error",
               status: "failed",
-              title: null,
+              title: failure.class === "usage_limit" ? "Usage limit reached" : null,
               completedAt,
               failure,
             },
@@ -1045,6 +1083,10 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
           });
         }
         yield* Deferred.succeed(turn.done, undefined);
+        // The turn is already settled. A slow or missing usage read must not hold it.
+        if (disposition === "reusable" && !turn.compact && options.onUsageLimits) {
+          yield* refreshSubscriptionUsage().pipe(Effect.forkIn(scope));
+        }
       });
       const failHost = Effect.fnUntraced(function* (cause: unknown) {
         if (closed || broken) return;
@@ -1284,6 +1326,11 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         }
       });
       const handleNotification = Effect.fnUntraced(function* (method: string, data: unknown) {
+        // No sessionId: the host reports the signed-in account, not one session.
+        if (method === "usage/changed") {
+          yield* publishSubscriptionUsage(yield* decode(MuseSubscriptionUsage, data));
+          return;
+        }
         const params = yield* decode(recordSchema, data);
         if (params.sessionId !== nativeSessionId) return;
         if (method === "view/gap")
@@ -1459,7 +1506,13 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
                     ? "interrupted"
                     : "cancelled"
                   : "failed";
-            yield* finish(turn, status, result.error?.message ?? result.reason);
+            yield* finish(
+              turn,
+              status,
+              result.error?.message ?? result.reason,
+              "reusable",
+              status === "failed" ? museTierLimitFailure(params.error) : undefined,
+            );
             break;
           }
           case "approval/requested":

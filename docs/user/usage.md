@@ -118,6 +118,11 @@ Grok reports the remaining subscription allowance and reset time for its current
 after signing in with `grok login`. Explicit `XAI_API_KEY` connections and custom authentication
 or endpoint configurations do not report subscription limits.
 
+Muse reports a 5-hour window and a weekly window after a turn, on Muse 1.4.6 or newer. A
+signed-in account is listed before that turn, with no bars until Muse has observed usage.
+Older Muse builds that cannot read usage stay off this view. An instance environment variable
+`META_API_KEY` uses pay-as-you-go billing and does not report subscription limits.
+
 API-key accounts may not report subscription limits. This also applies to Claude connections
 using a proxy through `ANTHROPIC_AUTH_TOKEN`.
 
