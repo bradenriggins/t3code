@@ -1,7 +1,16 @@
 import type { SendUserTurnOptions } from "@muse-code/sdk";
-import { ModelCapabilities, ServerProviderModel } from "@t3tools/contracts";
+import {
+  MUSE_DEFAULT_MODEL,
+  ModelCapabilities,
+  ServerProviderModel,
+  type ModelSelection,
+} from "@t3tools/contracts";
 import { MuseSettings } from "../settings.ts";
-import { createModelCapabilities, getProviderOptionDescriptors } from "@t3tools/shared/model";
+import {
+  createModelCapabilities,
+  getProviderOptionDescriptors,
+  modelSelectionsEqual,
+} from "@t3tools/shared/model";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { createMuseSdkHost, createMuseSdkHostEffect, type MuseSdkHost } from "./sdk.ts";
@@ -79,6 +88,54 @@ export function museModelCapabilities(
   });
 }
 
+/** A positive catalog `contextLimit`. Anything else means the host declared no window. */
+function positiveContextLimit(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+/** `contextLimit` by model id from the raw `model/list` payload. Invalid values are skipped. */
+function contextLimitsByModelId(result: unknown): ReadonlyMap<string, number> {
+  const limits = new Map<string, number>();
+  if (typeof result !== "object" || result === null || !("models" in result)) return limits;
+  const models = result.models;
+  if (!Array.isArray(models)) return limits;
+  for (const row of models) {
+    if (typeof row !== "object" || row === null || !("modelId" in row)) continue;
+    const modelId = row.modelId;
+    if (typeof modelId !== "string" || limits.has(modelId)) continue;
+    const limit = "contextLimit" in row ? positiveContextLimit(row.contextLimit) : undefined;
+    if (limit !== undefined) limits.set(modelId, limit);
+  }
+  return limits;
+}
+
+/** The catalog window for a picker model. The `default` sentinel selects the catalog default row. */
+export function museContextWindowTokens(
+  models: ReadonlyArray<
+    Pick<ServerProviderModel, "slug" | "isDefault" | "isCustom" | "contextWindowTokens">
+  >,
+  model: string,
+): number | undefined {
+  const selected =
+    model === MUSE_DEFAULT_MODEL
+      ? models.find((entry) => entry.isDefault === true && !entry.isCustom)
+      : models.find((entry) => entry.slug === model);
+  const tokens = selected?.contextWindowTokens;
+  return tokens !== undefined && tokens > 0 ? tokens : undefined;
+}
+
+/**
+ * Reasoning effort does not change Muse's context window, so a switch that
+ * keeps the same model can keep the measured usage.
+ */
+export function canReuseMuseContextUsage(previous: ModelSelection, next: ModelSelection): boolean {
+  const withoutEffort = (selection: ModelSelection) => ({
+    ...selection,
+    options: (selection.options ?? []).filter((option) => option.id !== "reasoningEffort"),
+  });
+  return modelSelectionsEqual(withoutEffort(previous), withoutEffort(next));
+}
+
 /** Apply the advertised model choices to saved, remembered and implicit efforts at dispatch. */
 export function resolveMuseReasoningEffort(
   capabilities: ModelCapabilities | null | undefined,
@@ -122,16 +179,19 @@ export const discoverMuseModels = Effect.fn("discoverMuseModels")(function* (
   if (catalog.providerId !== "meta") {
     return yield* new MuseCatalogError({ detail: "Muse returned a catalog for another provider." });
   }
+  const contextLimits = contextLimitsByModelId(result);
   const seen = new Set<string>();
   return catalog.models.flatMap((model): ServerProviderModel[] => {
     if (model.providerId !== "meta" || seen.has(model.modelId)) return [];
     seen.add(model.modelId);
+    const contextWindowTokens = contextLimits.get(model.modelId);
     return [
       {
         slug: model.modelId,
         name: model.displayLabel.trim() || model.modelId,
         isCustom: false,
         isDefault: model.isDefault,
+        ...(contextWindowTokens === undefined ? {} : { contextWindowTokens }),
         capabilities: museModelCapabilities(model),
       },
     ];

@@ -42,7 +42,11 @@ import * as ProviderHost from "@t3tools/provider-core/server/ProviderHost";
 import * as McpProviderSession from "@t3tools/provider-core/server/mcpSession";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import { buildRuntimeInstructions } from "@t3tools/provider-core/server/runtimeInstructions";
-import { museModelCapabilities, resolveMuseReasoningEffort } from "./modelCatalog.ts";
+import {
+  canReuseMuseContextUsage,
+  museModelCapabilities,
+  resolveMuseReasoningEffort,
+} from "./modelCatalog.ts";
 import {
   MuseApproval,
   MuseCompactResult,
@@ -192,6 +196,8 @@ export interface MuseAdapterV2Options {
   readonly settings: MuseSettings;
   readonly environment: NodeJS.ProcessEnv;
   readonly modelCatalog?: Effect.Effect<ReadonlyArray<ServerProviderModel>>;
+  /** Latest catalog window for a model slug, including the `default` sentinel. */
+  readonly contextWindowFor?: (model: string) => number | undefined;
   readonly createHost?: typeof createMuseSdkHost;
   readonly requestTimeoutMs?: number;
   readonly nativeEventLogger?: ProviderEventLoggers.EventNdjsonLogger;
@@ -2107,6 +2113,11 @@ export const makeMuseAdapterV2 = Effect.fn("makeMuseAdapterV2")(function* (
         providerSessionId: input.providerSessionId,
         providerSession: session,
         events: Stream.fromQueue(events),
+        getModelContextWindow: (selection) =>
+          selection.instanceId === options.instanceId
+            ? options.contextWindowFor?.(selection.model)
+            : undefined,
+        canReuseContextUsage: canReuseMuseContextUsage,
         // A running workflow or a held Muse turn keeps the host: idle release must wait.
         hasPendingBackgroundWork: Effect.sync(
           () => observedChildren.size > 0 || wake !== undefined,

@@ -89,6 +89,11 @@ export const ServerProviderModel = Schema.Struct({
   isDefault: Schema.optional(Schema.Boolean),
   isLegacy: Schema.optional(Schema.Boolean),
   capabilities: Schema.NullOr(ModelCapabilities),
+  /**
+   * Context window in tokens, when the provider catalog reports one.
+   * The context meter uses it until the session reports its own window.
+   */
+  contextWindowTokens: Schema.optional(Schema.Int.check(Schema.isGreaterThan(0))),
 });
 export type ServerProviderModel = typeof ServerProviderModel.Type;
 
