@@ -169,9 +169,13 @@ const makeFakeMuse = Effect.fnUntraced(function* (idPrefix = "native") {
     ) => {
       responses.set(method, [...(responses.get(method) ?? []), result]);
     },
-    emit: (method: string, params: Record<string, unknown>) =>
+    emit: (method: string, params: Record<string, unknown>, raw = false) =>
       Effect.sync(() => {
-        notify({ jsonrpc: "2.0", method, params: { sessionId, ...params } });
+        notify({
+          jsonrpc: "2.0",
+          method,
+          params: raw ? params : { sessionId, ...params },
+        });
       }),
     takeCall: Effect.fnUntraced(function* (method: string) {
       while (true) {
@@ -191,7 +195,7 @@ const makeHarness = Effect.fnUntraced(function* (
   policy = runtimePolicy,
   overrides: Pick<
     MuseAdapterV2Options,
-    "createHost" | "nativeEventLogger" | "modelCatalog" | "continuationRequests"
+    "createHost" | "nativeEventLogger" | "modelCatalog" | "continuationRequests" | "onUsageLimits"
   > = {},
 ) {
   let hostCount = 0;
@@ -1244,6 +1248,143 @@ describe("MuseAdapterV2", () => {
       const child = yield* harness.takeEvent("subagent.updated");
       assert.strictEqual(child.subagent.status, "failed");
       assert.strictEqual(child.subagent.result, "budget_exhausted");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("publishes a session-less usage/changed and skips a malformed one", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeMuse();
+      const updates = yield* Queue.unbounded<{
+        readonly checkedAt: string;
+        readonly windows: ReadonlyArray<{
+          readonly id: string;
+          readonly label: string;
+          readonly usedPercent: number;
+        }>;
+      }>();
+      const harness = yield* makeHarness(
+        fake,
+        INSTANCE_ID,
+        undefined,
+        undefined,
+        undefined,
+        runtimePolicy,
+        {
+          onUsageLimits: (update) => Queue.offer(updates, update).pipe(Effect.asVoid),
+        },
+      );
+      const { nativeId } = yield* startConversation(harness, fake);
+      const observedAtMs = 1_791_832_901_947;
+      yield* fake.emit(
+        "usage/changed",
+        {
+          observedAtMs,
+          tier: "27681631238169137",
+          window: { usedPercent: 140, resetsAtMs: 1_791_850_896_000, windowDurationMins: 300 },
+          weekly: { usedPercent: 4, resetsAtMs: 0 },
+        },
+        true,
+      );
+      const update = yield* Queue.take(updates);
+      assert.strictEqual(update.checkedAt, DateTime.formatIso(DateTime.makeUnsafe(observedAtMs)));
+      assert.strictEqual(update.windows.find((window) => window.id === "window")?.label, "5-hour");
+      assert.strictEqual(update.windows.find((window) => window.id === "window")?.usedPercent, 100);
+      assert.strictEqual(update.windows.find((window) => window.id === "weekly")?.usedPercent, 4);
+      yield* fake.emit("usage/changed", { tier: "missing-windows" }, true);
+      yield* fake.emit("turn/completed", { turnId: nativeId, terminal: "completed" });
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(terminal.status, "completed");
+      assert.strictEqual(yield* Queue.size(updates), 0);
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("reads usage after a turn and keeps going when the host has no usage method", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeMuse();
+      const updates = yield* Queue.unbounded<unknown>();
+      const harness = yield* makeHarness(
+        fake,
+        INSTANCE_ID,
+        undefined,
+        undefined,
+        undefined,
+        runtimePolicy,
+        {
+          onUsageLimits: (update) => Queue.offer(updates, update).pipe(Effect.asVoid),
+        },
+      );
+      const first = yield* startConversation(harness, fake);
+      fake.queueResponse("usage/read", {
+        usage: {
+          observedAtMs: 1_791_832_901_947,
+          tier: "27681631238169137",
+          window: { usedPercent: 12, resetsAtMs: 1_791_850_896_000, windowDurationMins: 300 },
+          weekly: { usedPercent: 3, resetsAtMs: 1_792_368_000_000 },
+        },
+      });
+      yield* fake.emit("turn/completed", { turnId: first.nativeId, terminal: "completed" });
+      const update = yield* Queue.take(updates);
+      assert.deepStrictEqual(
+        (update as { windows: Array<{ id: string; usedPercent: number }> }).windows.map(
+          (window) => [window.id, window.usedPercent],
+        ),
+        [
+          ["window", 12],
+          ["weekly", 3],
+        ],
+      );
+
+      const missing = new MspError({
+        code: -32601,
+        message: "Method not found",
+        data: { kind: "methodNotFound" },
+      });
+      fake.queueResponse("usage/read", missing);
+      fake.queueResponse("usage/read", missing);
+      const second = yield* startConversation(harness, fake, 2);
+      yield* fake.emit("turn/completed", { turnId: second.nativeId, terminal: "completed" });
+      const terminal = yield* harness.takeEvent(
+        "turn.terminal",
+        (event) => event.providerTurnId === second.providerTurn.id,
+      );
+      assert.strictEqual(terminal.status, "completed");
+      assert.strictEqual(terminal.threadDisposition, "reusable");
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
+  it.effect("maps a tier-limit stop onto the turn failure reset time", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeMuse();
+      const harness = yield* makeHarness(fake);
+      const { nativeId } = yield* startConversation(harness, fake);
+      const resetsAtMs = 1_791_850_896_000;
+      yield* fake.emit("turn/completed", {
+        turnId: nativeId,
+        terminal: "failed",
+        error: {
+          message: "You have reached your usage limit.",
+          quota: { limitKind: "tierLimit", resetsAtMs },
+        },
+      });
+      const terminal = yield* harness.takeEvent("turn.terminal");
+      assert.strictEqual(terminal.status, "failed");
+      assert.strictEqual(terminal.threadDisposition, "reusable");
+      assert.strictEqual(terminal.failure?.class, "usage_limit");
+      assert.strictEqual(
+        terminal.failure?.resetAt,
+        DateTime.formatIso(DateTime.makeUnsafe(resetsAtMs)),
+      );
+      yield* fake.emit("turn/completed", {
+        turnId: (yield* startConversation(harness, fake, 2)).nativeId,
+        terminal: "failed",
+        error: { message: "nope", quota: { limitKind: "tierLimit", resetsAtMs: "soon" } },
+      });
+      const malformed = yield* harness.takeEvent(
+        "turn.terminal",
+        (event) => event.failure?.class === "provider_error",
+      );
+      assert.strictEqual(malformed.threadDisposition, "reusable");
+      assert.strictEqual(malformed.failure?.resetAt, undefined);
     }).pipe(Effect.scoped, Effect.provide(testLayer)),
   );
 });

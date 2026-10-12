@@ -5,6 +5,7 @@ import { createModelCapabilities, getProviderOptionDescriptors } from "@t3tools/
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { createMuseSdkHost, createMuseSdkHostEffect, type MuseSdkHost } from "./sdk.ts";
+import { readMuseSubscriptionUsage, type MuseUsageProbe } from "./usageLimits.ts";
 
 type MuseReasoningEffort = NonNullable<SendUserTurnOptions<never>["reasoningEffort"]>;
 
@@ -97,11 +98,17 @@ class MuseCatalogError extends Schema.TaggedError<MuseCatalogError>()("MuseCatal
   detail: Schema.String,
 }) {}
 
-export const discoverMuseModels = Effect.fn("discoverMuseModels")(function* (
+export interface MuseCatalogProbe {
+  readonly models: ReadonlyArray<ServerProviderModel>;
+  readonly usage: MuseUsageProbe;
+}
+
+const loadMuseCatalog = Effect.fn("loadMuseCatalog")(function* (
   settings: MuseSettings,
   environment: NodeJS.ProcessEnv | undefined,
-  cwd?: string,
-  createHost: typeof createMuseSdkHost = createMuseSdkHost,
+  cwd: string | undefined,
+  createHost: typeof createMuseSdkHost,
+  includeUsage: boolean,
 ) {
   const host = yield* Effect.acquireRelease(
     createMuseSdkHostEffect(
@@ -123,7 +130,7 @@ export const discoverMuseModels = Effect.fn("discoverMuseModels")(function* (
     return yield* new MuseCatalogError({ detail: "Muse returned a catalog for another provider." });
   }
   const seen = new Set<string>();
-  return catalog.models.flatMap((model): ServerProviderModel[] => {
+  const models = catalog.models.flatMap((model): ServerProviderModel[] => {
     if (model.providerId !== "meta" || seen.has(model.modelId)) return [];
     seen.add(model.modelId);
     return [
@@ -136,4 +143,28 @@ export const discoverMuseModels = Effect.fn("discoverMuseModels")(function* (
       },
     ];
   });
+  // The same short-lived host. A missing method must not fail model discovery.
+  const usage = includeUsage
+    ? yield* readMuseSubscriptionUsage((method, params) => host.connection.request(method, params))
+    : ({ status: "unsupported" } as const);
+  return { models, usage } satisfies MuseCatalogProbe;
+});
+
+export const discoverMuseModels = Effect.fn("discoverMuseModels")(function* (
+  settings: MuseSettings,
+  environment: NodeJS.ProcessEnv | undefined,
+  cwd?: string,
+  createHost: typeof createMuseSdkHost = createMuseSdkHost,
+) {
+  return (yield* loadMuseCatalog(settings, environment, cwd, createHost, false)).models;
+});
+
+/** Model list plus `usage/read` on one host, so a status check does not start Muse twice. */
+export const discoverMuseCatalog = Effect.fn("discoverMuseCatalog")(function* (
+  settings: MuseSettings,
+  environment: NodeJS.ProcessEnv | undefined,
+  cwd?: string,
+  createHost: typeof createMuseSdkHost = createMuseSdkHost,
+) {
+  return yield* loadMuseCatalog(settings, environment, cwd, createHost, true);
 });

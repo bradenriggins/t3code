@@ -151,6 +151,44 @@ export const MuseContextUsage = Schema.Struct({
 export const MuseTodoList = Schema.Struct({
   items: Schema.Array(Schema.Struct({ text: Schema.String, status: Schema.String })),
 });
+const NonNegativeFinite = Schema.Finite.check(Schema.isGreaterThanOrEqualTo(0));
+
+/**
+ * Muse subscription usage. `usage/read` returns `{ usage? }` and `usage/changed`
+ * sends this object. `tier` is an opaque id; 1.4.6 sends a string, and some
+ * hosts send the same id as a number.
+ */
+export const MuseSubscriptionUsage = Schema.Struct({
+  observedAtMs: Schema.Finite,
+  tier: Schema.Union([Schema.String, Schema.Finite]),
+  window: Schema.Struct({
+    usedPercent: NonNegativeFinite,
+    resetsAtMs: Schema.Finite,
+    windowDurationMins: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  }),
+  weekly: Schema.Struct({
+    usedPercent: NonNegativeFinite,
+    resetsAtMs: Schema.Finite,
+  }),
+});
+export type MuseSubscriptionUsage = typeof MuseSubscriptionUsage.Type;
+
+/** `{ usage? }` — omitted, never null, when the host has observed nothing. */
+export const MuseUsageReadResult = Schema.Struct({
+  usage: Schema.optional(MuseSubscriptionUsage),
+});
+export type MuseUsageReadResult = typeof MuseUsageReadResult.Type;
+
+/**
+ * Present on a turn failure only when the turn stopped on quota.
+ * Read apart from `MuseTurnCompleted` so a bad quota object cannot fail the turn.
+ */
+export const MuseQuotaDetail = Schema.Struct({
+  limitKind: Schema.String,
+  resetsAtMs: Schema.Finite,
+});
+export type MuseQuotaDetail = typeof MuseQuotaDetail.Type;
+
 export const MuseTurnCompleted = Schema.Struct({
   turnId: NonEmptyString,
   terminal: NonEmptyString,

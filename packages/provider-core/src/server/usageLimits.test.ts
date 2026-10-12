@@ -86,4 +86,10 @@ describe("resolveUsageLimitsAfterProbe", () => {
     expect(resolveUsageLimitsAfterProbe({ published, probed: unsupported })).toBe(unsupported);
     expect(resolveUsageLimitsAfterProbe({ published: undefined, probed: failed })).toBe(failed);
   });
+
+  it("keeps published windows when a probe lists none", () => {
+    const empty = { checkedAt: "2026-09-03T13:00:00.000Z", windows: [] };
+    expect(resolveUsageLimitsAfterProbe({ published, probed: empty })).toBe(published);
+    expect(resolveUsageLimitsAfterProbe({ published: undefined, probed: empty })).toBe(empty);
+  });
 });

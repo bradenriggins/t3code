@@ -9,7 +9,8 @@ import * as ChildProcess from "effect/process/ChildProcess";
 
 import { createMuseSdkHost, makeMuseEnvironment } from "./sdk.ts";
 import { parseMuseVersion } from "./maintenance.ts";
-import { discoverMuseModels, museModelCapabilities } from "./modelCatalog.ts";
+import { discoverMuseCatalog, museModelCapabilities } from "./modelCatalog.ts";
+import { limitsFromMuseProbe, museSubscriptionLogin } from "./usageLimits.ts";
 import {
   buildServerProvider,
   COMPACT_SLASH_COMMAND,
@@ -118,7 +119,7 @@ export const checkMuseProviderStatus = Effect.fn("checkMuseProviderStatus")(func
     });
   }
 
-  const catalog = yield* discoverMuseModels(settings, museEnvironment, cwd, createHost).pipe(
+  const catalog = yield* discoverMuseCatalog(settings, museEnvironment, cwd, createHost).pipe(
     Effect.scoped,
     Effect.timeoutOption(12_000),
     Effect.result,
@@ -133,14 +134,17 @@ export const checkMuseProviderStatus = Effect.fn("checkMuseProviderStatus")(func
         "Muse Code SDK could not read the model catalog. Check your Muse installation and run `muse login` on this T3 server host.",
     });
   }
-  const models = catalog.success.value;
-  // MSP has no auth signal, and model/list answers from Muse's cache even when logged out.
-  // Auth failures surface on the first turn instead.
+  const { models, usage } = catalog.success.value;
+  // model/list answers from Muse's cache even when logged out. A saved oauth
+  // login is enough to list the account; the bars arrive on the first turn.
+  const subscriptionLogin = yield* museSubscriptionLogin(museEnvironment);
+  const usageLimits = limitsFromMuseProbe({ checkedAt, probe: usage, subscriptionLogin });
   return snapshot(
     {
       installed: true,
       version,
       auth: { status: "unknown" },
+      ...(usageLimits ? { usageLimits } : {}),
       ...(models.length > 0
         ? { status: "ready" }
         : {
