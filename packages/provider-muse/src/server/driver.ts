@@ -1,4 +1,4 @@
-import { ProviderDriverKind } from "@t3tools/contracts";
+import { ProviderDriverKind, type ServerProviderModel } from "@t3tools/contracts";
 import { MuseSettings } from "../settings.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as Effect from "effect/Effect";
@@ -17,6 +17,7 @@ import { ProviderDriverError } from "@t3tools/provider-core/server/errors";
 import { makeMuseAdapterV2 } from "./adapter.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
+import { museContextWindowTokens } from "./modelCatalog.ts";
 import { checkMuseProviderStatus, makePendingMuseProvider } from "./status.ts";
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import { makeManagedServerProvider } from "@t3tools/provider-core/server/managedProvider";
@@ -118,6 +119,8 @@ export const MuseDriver: ProviderDriver<MuseSettings, MuseDriverEnv> = {
             : undefined;
           return latestVersion !== undefined ? { ...capabilities, latestVersion } : capabilities;
         });
+      // The probe publishes models after the adapter exists. The closure reads the latest list.
+      let catalogModels: ReadonlyArray<ServerProviderModel> = [];
       const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<MuseSettings>>({
         resolveMaintenance,
         getSettings: snapshotSettings.getSettings,
@@ -126,7 +129,11 @@ export const MuseDriver: ProviderDriver<MuseSettings, MuseDriverEnv> = {
         initialSnapshot: (settings) =>
           makePendingMuseProvider(settings.provider).pipe(Effect.map(stampIdentity)),
         checkProvider: checkMuseProviderStatus(effectiveConfig, processEnvironment, cwd).pipe(
-          Effect.map(stampIdentity),
+          Effect.map((provider) => {
+            const stamped = stampIdentity(provider);
+            catalogModels = stamped.models;
+            return stamped;
+          }),
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
           Effect.provideService(FileSystem.FileSystem, fileSystem),
           Effect.provideService(Path.Path, path),
@@ -162,6 +169,7 @@ export const MuseDriver: ProviderDriver<MuseSettings, MuseDriverEnv> = {
         settings: effectiveConfig,
         environment: processEnvironment,
         modelCatalog,
+        contextWindowFor: (model) => museContextWindowTokens(catalogModels, model),
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
         continuationRequests,
       });

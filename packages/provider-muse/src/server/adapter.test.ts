@@ -191,7 +191,11 @@ const makeHarness = Effect.fnUntraced(function* (
   policy = runtimePolicy,
   overrides: Pick<
     MuseAdapterV2Options,
-    "createHost" | "nativeEventLogger" | "modelCatalog" | "continuationRequests"
+    | "createHost"
+    | "nativeEventLogger"
+    | "modelCatalog"
+    | "contextWindowFor"
+    | "continuationRequests"
   > = {},
 ) {
   let hostCount = 0;
@@ -351,6 +355,45 @@ const approval = (turnId: string) => ({
 });
 
 describe("MuseAdapterV2", () => {
+  it.effect("reports the catalog context window and keeps it across an effort change", () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFakeMuse();
+      const harness = yield* makeHarness(
+        fake,
+        INSTANCE_ID,
+        undefined,
+        undefined,
+        undefined,
+        runtimePolicy,
+        {
+          contextWindowFor: (model) => (model === MODEL ? 1_048_576 : undefined),
+        },
+      );
+      assert.strictEqual(harness.runtime.getModelContextWindow?.(modelSelection()), 1_048_576);
+      assert.strictEqual(
+        harness.runtime.getModelContextWindow?.({
+          ...modelSelection(),
+          instanceId: ProviderInstanceId.make("other"),
+        }),
+        undefined,
+      );
+      assert.strictEqual(
+        harness.runtime.canReuseContextUsage?.(modelSelection(), {
+          ...modelSelection(),
+          options: [{ id: "reasoningEffort", value: "low" }],
+        }),
+        true,
+      );
+      assert.strictEqual(
+        harness.runtime.canReuseContextUsage?.(modelSelection(), {
+          ...modelSelection(),
+          model: "muse-wonder-1.0",
+        }),
+        false,
+      );
+    }).pipe(Effect.scoped, Effect.provide(testLayer)),
+  );
+
   it.effect("connects the thread's MCP credential on native start and resume", () =>
     Effect.gen(function* () {
       yield* (yield* McpProviderSessions.McpProviderSessions).set({
